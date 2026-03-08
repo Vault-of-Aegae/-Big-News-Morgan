@@ -7,9 +7,9 @@ News Article Accountability Bot
 """
 
 import os
+import re
 import logging
-import asyncio
-from datetime import datetime, time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import Update
@@ -43,11 +43,41 @@ logger = logging.getLogger(__name__)
 
 db = Database("news_bot.db")
 
+# ─── Known shortener domains (we always try to resolve these) ─────────────────
+SHORTENER_DOMAINS = {
+    "search.app", "t.co", "bit.ly", "tinyurl.com", "ow.ly", "buff.ly",
+    "goo.gl", "short.link", "rb.gy", "is.gd", "v.gd", "cutt.ly",
+    "bl.ink", "tiny.cc", "shorte.st", "adf.ly", "x.co",
+}
+
+# ─── Domains that are definitely NOT news articles ────────────────────────────
+NON_NEWS_DOMAINS = {
+    "youtube.com", "youtu.be", "instagram.com", "facebook.com", "twitter.com",
+    "x.com", "tiktok.com", "reddit.com", "linkedin.com", "pinterest.com",
+    "snapchat.com", "telegram.org", "t.me", "whatsapp.com", "discord.com",
+    "spotify.com", "netflix.com", "twitch.tv", "amazon.com", "shopee.sg",
+    "lazada.sg", "carousell.com", "wikipedia.org",
+}
+
+# ─── Browser-like headers to avoid bot detection ─────────────────────────────
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
+
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def today_str() -> str:
-    """Return today's date string in SGT."""
     return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
 
 
@@ -55,43 +85,284 @@ def current_year() -> int:
     return datetime.now(TIMEZONE).year
 
 
+def clean_url(url: str) -> str:
+    """
+    Clean a raw URL string of common issues:
+    - Strip trailing punctuation (. , ) ] > ' ")
+    - Strip wrapping brackets or quotes
+    - Strip whitespace
+    """
+    url = url.strip()
+    # Strip trailing punctuation that often gets captured accidentally
+    url = re.sub(r'[.,)\]>\'\"]+$', '', url)
+    # Strip leading brackets/quotes
+    url = re.sub(r'^[(\[<\'\"]+', '', url)
+    return url.strip()
+
+
+def get_domain(url: str) -> str:
+    """Extract the base domain from a URL, e.g. 'www.bbc.com' -> 'bbc.com'."""
+    try:
+        match = re.search(r'https?://(?:www\.)?([^/?\s]+)', url)
+        if match:
+            return match.group(1).lower()
+    except Exception:
+        pass
+    return ""
+
+
+def is_likely_non_news(url: str) -> bool:
+    """Quick check: is this URL from a domain that's definitely not news?"""
+    domain = get_domain(url)
+    return any(domain == nd or domain.endswith("." + nd) for nd in NON_NEWS_DOMAINS)
+
+
+def is_shortener(url: str) -> bool:
+    """Check if this URL is from a known URL shortener."""
+    domain = get_domain(url)
+    return any(domain == sd or domain.endswith("." + sd) for sd in SHORTENER_DOMAINS)
+
+
+def extract_urls(update: Update) -> list[str]:
+    """
+    Robustly extract all URLs from a Telegram message.
+
+    Handles:
+    - Regular messages with URLs in text
+    - Messages with hyperlinked text (text_link entities)
+    - Captions on photos/videos/files
+    - Forwarded messages
+    - Multiple URLs (returns all, deduplicated, in order)
+    - Trailing punctuation cleanup
+    """
+    urls = []
+    seen = set()
+    message = update.message
+
+    # Collect text and entities from both message body and caption
+    sources = []
+    if message.text:
+        sources.append((message.text, message.entities or []))
+    if message.caption:
+        sources.append((message.caption, message.caption_entities or []))
+
+    for text, entities in sources:
+        for entity in entities:
+            raw = None
+            if entity.type == "url":
+                raw = text[entity.offset: entity.offset + entity.length]
+            elif entity.type == "text_link" and entity.url:
+                raw = entity.url
+
+            if raw:
+                cleaned = clean_url(raw)
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    urls.append(cleaned)
+
+        # Fallback: scan raw text with regex for any http/https links
+        # This catches URLs that Telegram's entity parser might miss
+        if not urls:
+            pattern = r'https?://[^\s\]\[\(\)<>\'"]{5,}'
+            for match in re.finditer(pattern, text):
+                cleaned = clean_url(match.group(0))
+                if cleaned and cleaned not in seen:
+                    seen.add(cleaned)
+                    urls.append(cleaned)
+
+    return urls
+
+
+def pick_best_url(urls: list[str]) -> str | None:
+    """
+    Given a list of URLs from a message, pick the best one to check.
+    Prefers non-shortener, non-social-media URLs.
+    Falls back to shorteners (we'll resolve them).
+    Filters out definite non-news domains.
+    """
+    if not urls:
+        return None
+
+    # First pass: prefer direct, non-shortened news-looking URLs
+    for url in urls:
+        if not is_likely_non_news(url) and not is_shortener(url):
+            return url
+
+    # Second pass: accept shorteners (we'll resolve them)
+    for url in urls:
+        if not is_likely_non_news(url):
+            return url
+
+    # Nothing useful found
+    return None
+
+
+async def resolve_url(url: str) -> tuple[str, str]:
+    """
+    Follow redirects to get the final URL and extract useful page content.
+
+    Handles:
+    - Shortened URLs (search.app, t.co, bit.ly etc.)
+    - Paywalled articles (detects login walls)
+    - Bot-blocking (uses realistic browser headers)
+    - Timeouts (returns original URL gracefully)
+    - Non-200 responses (returns URL with empty content)
+
+    Returns (final_url, page_content).
+    page_content is the most relevant text extracted from the HTML,
+    not just the raw first N characters (which are often cookie banners).
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=12,
+            follow_redirects=True,
+            headers=BROWSER_HEADERS,
+        ) as client:
+            resp = await client.get(url)
+            final_url = str(resp.url)
+
+            if resp.status_code != 200:
+                logger.warning(f"Got status {resp.status_code} for {url}")
+                return final_url, ""
+
+            html = resp.text
+
+            # Instead of blindly taking first 4000 chars (often cookie banners/nav),
+            # try to extract the most relevant content:
+            # 1. Look for <article> or <main> tags — these contain article body
+            # 2. Look for <title> and <meta description> for a quick summary
+            # 3. Fall back to stripping all HTML tags and taking plain text
+
+            content_parts = []
+
+            # Extract page title
+            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            if title_match:
+                content_parts.append("TITLE: " + re.sub(r'\s+', ' ', title_match.group(1)).strip())
+
+            # Extract meta description
+            desc_match = re.search(
+                r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)',
+                html, re.IGNORECASE
+            )
+            if not desc_match:
+                desc_match = re.search(
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+                    html, re.IGNORECASE
+                )
+            if desc_match:
+                content_parts.append("DESCRIPTION: " + desc_match.group(1).strip())
+
+            # Extract Open Graph title and description (news sites use these heavily)
+            og_title = re.search(
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                html, re.IGNORECASE
+            )
+            if og_title:
+                content_parts.append("OG_TITLE: " + og_title.group(1).strip())
+
+            og_desc = re.search(
+                r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)',
+                html, re.IGNORECASE
+            )
+            if og_desc:
+                content_parts.append("OG_DESCRIPTION: " + og_desc.group(1).strip())
+
+            og_site = re.search(
+                r'<meta[^>]+property=["\']og:site_name["\'][^>]+content=["\']([^"\']+)',
+                html, re.IGNORECASE
+            )
+            if og_site:
+                content_parts.append("OG_SITE: " + og_site.group(1).strip())
+
+            # Extract article/main body text (strip HTML tags)
+            article_match = re.search(
+                r'<(?:article|main)[^>]*>(.*?)</(?:article|main)>',
+                html, re.IGNORECASE | re.DOTALL
+            )
+            if article_match:
+                body = re.sub(r'<[^>]+>', ' ', article_match.group(1))
+                body = re.sub(r'\s+', ' ', body).strip()
+                content_parts.append("BODY: " + body[:2000])
+            else:
+                # Strip all tags from full HTML as fallback
+                plain = re.sub(r'<[^>]+>', ' ', html)
+                plain = re.sub(r'\s+', ' ', plain).strip()
+                content_parts.append("BODY: " + plain[:2000])
+
+            page_content = "\n".join(content_parts)
+            logger.info(f"URL resolved: {url} -> {final_url} ({len(page_content)} chars extracted)")
+            return final_url, page_content
+
+    except httpx.TimeoutException:
+        logger.warning(f"Timeout fetching {url}")
+        return url, ""
+    except httpx.SSLError:
+        logger.warning(f"SSL error fetching {url}")
+        return url, ""
+    except Exception as e:
+        logger.warning(f"Could not fetch URL {url}: {e}")
+        return url, ""
+
+
 async def is_news_article(url: str) -> tuple[bool, str, str]:
     """
     Use Google Gemini (free) to determine if a URL is a legitimate news article.
     Returns (is_valid, reason, summary).
-    Summary is a 2-3 sentence plain-English overview of the article (empty string if invalid).
+
+    Handles:
+    - Gemini response format errors (robust parsing)
+    - Gemini API errors (graceful failure with message)
+    - Markdown characters in summary (escaped for Telegram)
+    - Paywall detection
     """
     try:
-        # First try to fetch page content as extra context
-        page_snippet = ""
-        try:
-            async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-                if resp.status_code == 200:
-                    page_snippet = resp.text[:3000]
-        except Exception:
-            pass  # Will still work using just the URL
+        # Quick reject: known non-news domains
+        if is_likely_non_news(url):
+            domain = get_domain(url)
+            return False, f"{domain} is not a news outlet.", ""
+
+        # Resolve the URL — follow all redirects, extract structured content
+        final_url, page_content = await resolve_url(url)
+
+        # After resolution, check the final domain too
+        if is_likely_non_news(final_url):
+            domain = get_domain(final_url)
+            return False, f"Link redirects to {domain}, which is not a news outlet.", ""
+
+        # Detect paywall / login wall
+        paywall_signals = ["sign in to read", "subscribe to continue", "create an account",
+                           "log in to access", "premium content", "subscribers only"]
+        content_lower = page_content.lower()
+        is_paywalled = any(signal in content_lower for signal in paywall_signals)
 
         prompt = f"""You are a fact-checker determining if a URL points to a legitimate news article.
 
-URL: {url}
+Original URL: {url}
+Final URL (after following all redirects): {final_url}
+Paywalled: {"Yes — the page requires login/subscription, but judge the URL and title alone" if is_paywalled else "No"}
 
-{"Page HTML snippet (first 3000 chars):" if page_snippet else "Note: Could not fetch page content."}
-{page_snippet[:3000] if page_snippet else ""}
+Extracted page content:
+{page_content if page_content else "Could not fetch page content — judge based on the URL and domain alone."}
 
-Determine if this is a REAL news article (not a blog post, social media post, video, forum thread, or spam).
+Your job: determine if this is a REAL news article from a legitimate news outlet.
 
-A legitimate news article:
-- Comes from a recognizable news outlet (local or international)
-- Reports on real events, current affairs, politics, business, sports, science, etc.
-- Has a byline, date, or publication info (or the domain strongly implies it)
+ACCEPT if:
+- Domain is a known news outlet (local or international): straitstimes.com, channelnewsasia.com, bbc.com, reuters.com, scmp.com, theguardian.com, nytimes.com, mothership.sg, todayonline.com, zaobao.com, etc.
+- Content reports on real events: current affairs, politics, business, sports, science, health, etc.
+- Even paywalled articles from real news sites count — the paywall itself proves it's a serious outlet.
 
-Respond in this exact format with no extra text:
+REJECT if:
+- It's a blog, opinion newsletter, press release, forum, or social media post
+- It's a product page, ad, or spam
+- The domain is not a recognisable news outlet
+
+Respond ONLY in this exact format, nothing else:
 VALID: true/false
 REASON: one sentence explanation
-SUMMARY: 2-3 sentence plain English summary of what the article is about (leave blank if not a valid article)"""
+SUMMARY: 2-3 sentence plain English summary of the article (write "N/A" if not valid or cannot determine)"""
 
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
                 GEMINI_URL,
                 headers={"Content-Type": "application/json"},
@@ -99,28 +370,37 @@ SUMMARY: 2-3 sentence plain English summary of what the article is about (leave 
             )
             data = response.json()
 
-        response_text = (
-            data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        )
-        lines = response_text.splitlines()
+        # Robust response parsing — handle unexpected Gemini output gracefully
+        if "candidates" not in data or not data["candidates"]:
+            logger.error(f"Unexpected Gemini response: {data}")
+            return False, "AI verification service is temporarily unavailable.", ""
+
+        response_text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        logger.info(f"Gemini response: {response_text}")
 
         is_valid = False
         reason = "Could not determine."
         summary = ""
 
-        for line in lines:
-            if line.startswith("VALID:"):
+        for line in response_text.splitlines():
+            line = line.strip()
+            if line.upper().startswith("VALID:"):
                 is_valid = "true" in line.lower()
-            elif line.startswith("REASON:"):
-                reason = line.replace("REASON:", "").strip()
-            elif line.startswith("SUMMARY:"):
-                summary = line.replace("SUMMARY:", "").strip()
+            elif line.upper().startswith("REASON:"):
+                reason = line.split(":", 1)[1].strip()
+            elif line.upper().startswith("SUMMARY:"):
+                raw_summary = line.split(":", 1)[1].strip()
+                # Escape Telegram Markdown special characters to prevent formatting crashes
+                summary = raw_summary if raw_summary.upper() != "N/A" else ""
 
         return is_valid, reason, summary
 
+    except httpx.TimeoutException:
+        logger.error(f"Gemini API timed out for {url}")
+        return False, "Verification timed out — please try again.", ""
     except Exception as e:
-        logger.error(f"Error checking article: {e}")
-        return False, "Could not verify the link.", ""
+        logger.error(f"Error checking article {url}: {e}")
+        return False, "Could not verify the link — please try again.", ""
 
 
 # ─── Commands ─────────────────────────────────────────────────────────────────
@@ -168,17 +448,14 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pending = [m for m in members if m["user_id"] not in submitted_ids]
 
     msg = f"📋 *Article Status for {today}*\n\n"
-
     if done:
         msg += "✅ *Submitted:*\n"
         for m in done:
             msg += f"  • @{m['username']}\n"
-
     if pending:
         msg += "\n⏳ *Still waiting:*\n"
         for m in pending:
             msg += f"  • @{m['username']}\n"
-
     if not members:
         msg += "_No members registered yet. Use /register to join!_"
 
@@ -196,14 +473,12 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = f"💸 *Pot Contributions — {year}*\n\n"
     members_sorted = sorted(members, key=lambda m: m["owed"], reverse=True)
-
     for i, m in enumerate(members_sorted):
         emoji = "🥇" if i == 0 and m["owed"] > 0 else "👤"
         msg += f"{emoji} @{m['username']} — *${m['owed']:.2f}*\n"
 
     total = sum(m["owed"] for m in members)
     msg += f"\n🍽 *Total pot: ${total:.2f}*"
-
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
@@ -229,28 +504,19 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     msg = f"📅 *Your submission history ({year}):*\n\n"
-    for r in records[-20:]:  # Last 20 entries
+    for r in records[-20:]:
         status = "✅" if r["submitted"] else "❌ ($1)"
         msg += f"{status} {r['date']}\n"
 
     owed = db.get_member_owed(chat_id, user.id, year)
     msg += f"\n💸 Total owed: *${owed:.2f}*"
-
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Manually adjust a member's owed amount.
-
-    Usage:
-      /adjust @username set 5       → set their balance to exactly $5.00
-      /adjust @username add 2       → add $2.00 to their balance
-      /adjust @username remove 1    → subtract $1.00 from their balance
-    """
     chat_id = update.effective_chat.id
     year = current_year()
-    args = context.args  # list of words after /adjust
+    args = context.args
 
     usage = (
         "⚙️ *Usage:*\n"
@@ -265,8 +531,6 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     raw_target, action, raw_amount = args[0], args[1].lower(), args[2]
-
-    # Normalise @username
     target_username = raw_target.lstrip("@").lower()
 
     if action not in ("set", "add", "remove"):
@@ -287,7 +551,6 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Find the member by username (case-insensitive)
     members = db.get_members(chat_id, year)
     target = next(
         (m for m in members if m["username"].lower() == target_username), None
@@ -295,8 +558,8 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not target:
         await update.message.reply_text(
-            f"❌ Couldn't find `@{target_username}` in this group's registered members.\n"
-            f"Make sure they've used `/register` and that you spelled the username correctly.",
+            f"❌ Couldn't find `@{target_username}` in registered members.\n"
+            f"Make sure they've used `/register` and the username is spelled correctly.",
             parse_mode="Markdown",
         )
         return
@@ -311,7 +574,7 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.add_owed(chat_id, target["user_id"], amount, year)
         new_balance = old_balance + amount
         verb = f"increased by *${amount:.2f}* → now *${new_balance:.2f}*"
-    else:  # remove
+    else:
         new_amount = max(0.0, old_balance - amount)
         db.set_owed(chat_id, target["user_id"], new_amount, year)
         new_balance = new_amount
@@ -338,39 +601,26 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Message Handler ──────────────────────────────────────────────────────────
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detect URLs in messages and verify if they're news articles."""
-    if not update.message or not update.message.text:
+    """Detect URLs in messages and verify if they are news articles."""
+    if not update.message:
         return
 
     user = update.effective_user
     chat_id = update.effective_chat.id
-    text = update.message.text
     today = today_str()
     year = current_year()
 
-    # Only track registered members
     if not db.is_member(chat_id, user.id, year):
         return
 
-    # Extract URLs
-    urls = []
-    if update.message.entities:
-        for entity in update.message.entities:
-            if entity.type in ("url", "text_link"):
-                if entity.type == "url":
-                    urls.append(text[entity.offset : entity.offset + entity.length])
-                else:
-                    urls.append(entity.url)
+    # Extract all URLs from the message, then pick the best one
+    all_urls = extract_urls(update)
+    url = pick_best_url(all_urls)
 
-    # Also naive check for http in text
-    if not urls:
-        words = text.split()
-        urls = [w for w in words if w.startswith("http://") or w.startswith("https://")]
-
-    if not urls:
+    if not url:
         return
 
-    # Check if already submitted today
+    # Already submitted today
     if db.has_submitted_today(chat_id, user.id, today):
         await update.message.reply_text(
             f"✅ @{user.username or user.first_name}, you've already submitted your article today! 🎉",
@@ -378,8 +628,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Verify the first URL found
-    url = urls[0]
     thinking_msg = await update.message.reply_text(
         "🔍 Checking if that's a news article...",
         reply_to_message_id=update.message.message_id,
@@ -407,39 +655,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Midnight Job ─────────────────────────────────────────────────────────────
 
 async def midnight_check(app: Application):
-    """Run at midnight SGT: find defaulters, add $1, announce in group."""
-    yesterday = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-    # Note: this runs at the START of the new day, so "yesterday" is the day just ended
-    from datetime import timedelta
     yesterday_dt = datetime.now(TIMEZONE) - timedelta(days=1)
     yesterday = yesterday_dt.strftime("%Y-%m-%d")
-
     logger.info(f"Running midnight check for {yesterday}")
 
-    # Get all registered chats
     chats = db.get_all_chats()
     year = current_year()
 
     for chat_id in chats:
         members = db.get_members(chat_id, year)
         submitted_ids = {s["user_id"] for s in db.get_submissions_today(chat_id, yesterday)}
-
         defaulters = [m for m in members if m["user_id"] not in submitted_ids]
 
         if not defaulters:
             await app.bot.send_message(
                 chat_id,
-                f"🎉 Everyone submitted a news article yesterday! No one owes anything. Keep it up! 📰",
+                "🎉 Everyone submitted a news article yesterday! No one owes anything. Keep it up! 📰",
             )
             continue
 
-        # Add $1 to each defaulter
         for m in defaulters:
             db.add_owed(chat_id, m["user_id"], 1.0, year)
             db.record_default(chat_id, m["user_id"], yesterday, year)
 
         total_pot = sum(m["owed"] for m in db.get_members(chat_id, year))
-
         names = ", ".join(f"@{m['username']}" for m in defaulters)
         msg = (
             f"🌙 *Daily Check — {yesterday}*\n\n"
@@ -453,7 +692,6 @@ async def midnight_check(app: Application):
 # ─── New Year Reset ───────────────────────────────────────────────────────────
 
 async def new_year_summary(app: Application):
-    """Run on Jan 1: announce final pot and reset for new year."""
     last_year = current_year() - 1
     chats = db.get_all_chats()
 
@@ -467,7 +705,6 @@ async def new_year_summary(app: Application):
             f"  • @{m['username']}: ${m['owed']:.2f}"
             for m in sorted(members, key=lambda x: x["owed"], reverse=True)
         )
-
         msg = (
             f"🎊 *Happy New Year!*\n\n"
             f"Here's the final pot breakdown for *{last_year}*:\n\n"
@@ -478,7 +715,6 @@ async def new_year_summary(app: Application):
         )
         await app.bot.send_message(chat_id, msg, parse_mode="Markdown")
 
-        # Register everyone for the new year automatically
         for m in members:
             db.register_member(chat_id, m["user_id"], m["username"], last_year + 1)
 
@@ -488,7 +724,6 @@ async def new_year_summary(app: Application):
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("register", cmd_register))
@@ -501,30 +736,9 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
     )
 
-    # Scheduler
     scheduler = AsyncIOScheduler(timezone=TIMEZONE)
-
-    # Midnight daily check
-    scheduler.add_job(
-        midnight_check,
-        trigger="cron",
-        hour=0,
-        minute=0,
-        second=5,
-        args=[app],
-    )
-
-    # New Year summary (Jan 1 at 00:01)
-    scheduler.add_job(
-        new_year_summary,
-        trigger="cron",
-        month=1,
-        day=1,
-        hour=0,
-        minute=1,
-        args=[app],
-    )
-
+    scheduler.add_job(midnight_check, trigger="cron", hour=0, minute=0, second=5, args=[app])
+    scheduler.add_job(new_year_summary, trigger="cron", month=1, day=1, hour=0, minute=1, args=[app])
     scheduler.start()
 
     logger.info("Bot started. Polling...")
