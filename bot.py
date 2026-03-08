@@ -20,6 +20,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import asyncio
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -50,6 +51,130 @@ SHORTENER_DOMAINS = {
     "bl.ink", "tiny.cc", "shorte.st", "adf.ly", "x.co",
 }
 
+# ─── Trusted news domains — always accepted, no AI check needed ───────────────
+TRUSTED_NEWS_DOMAINS = {
+    # ── Singapore ────────────────────────────────────────────────────────────
+    "straitstimes.com", "channelnewsasia.com", "cna.asia", "todayonline.com",
+    "mothership.sg", "zaobao.com", "beritaharian.sg", "tamilmurasu.com.sg",
+    "businesstimes.com.sg", "theedgesingapore.com", "asiaone.com",
+    "tnp.sg", "newpaper.com.sg", "ricemedia.co", "theonlinecitizen.com",
+    "dollars-and-sense.sg", "sgcarmart.com.sg",
+
+    # ── Southeast Asia ───────────────────────────────────────────────────────
+    # Malaysia
+    "thestar.com.my", "nst.com.my", "freemalaysiatoday.com", "malaymail.com",
+    "malaysiakini.com", "sinchew.com.my", "theedgemarkets.com",
+    "bernama.com", "astroawani.com",
+    # Indonesia
+    "kompas.com", "thejakartapost.com", "detik.com", "tempo.co",
+    "antaranews.com", "tribunnews.com", "republika.co.id",
+    # Philippines
+    "rappler.com", "philstar.com", "inquirer.net", "abs-cbn.com",
+    "gmanetwork.com", "mb.com.ph", "pna.gov.ph",
+    # Thailand
+    "bangkokpost.com", "nationthailand.com", "thaipbs.or.th",
+    # Vietnam
+    "vietnamnews.vn", "tuoitrenews.vn", "vnexpress.net",
+    # Myanmar
+    "irrawaddy.com", "mizzima.com",
+    # Cambodia / Laos
+    "phnompenhpost.com", "khmertimeskh.com",
+
+    # ── Asia Pacific ─────────────────────────────────────────────────────────
+    # Hong Kong / China
+    "scmp.com", "hk01.com", "rthk.hk", "chinadaily.com.cn",
+    "globaltimes.cn", "xinhuanet.com",
+    # Japan
+    "japantimes.co.jp", "nhk.or.jp", "asahi.com", "mainichi.jp",
+    "yomiuri.co.jp", "nikkei.com",
+    # South Korea
+    "koreatimes.co.kr", "koreaherald.com", "yonhapnewsagency.com",
+    # Taiwan
+    "taipeitimes.com", "focustaiwan.tw",
+    # India
+    "thehindu.com", "hindustantimes.com", "ndtv.com", "timesofindia.com",
+    "indianexpress.com", "theprint.in", "scroll.in", "thewire.in",
+    "livemint.com", "economictimes.com", "businessstandard.com",
+    "news18.com", "firstpost.com", "india.com", "dnaindia.com",
+    # Australia / New Zealand
+    "abc.net.au", "smh.com.au", "theage.com.au", "afr.com",
+    "theaustralian.com.au", "news.com.au", "heraldsun.com.au",
+    "stuff.co.nz", "nzherald.co.nz", "rnz.co.nz",
+    # Pakistan / Bangladesh / Sri Lanka
+    "dawn.com", "geo.tv", "thenews.com.pk", "thedailystar.net",
+    "colombopage.com", "dailymirror.lk",
+
+    # ── Middle East ──────────────────────────────────────────────────────────
+    "aljazeera.com", "arabnews.com", "gulfnews.com", "thenationalnews.com",
+    "khaleejtimes.com", "haaretz.com", "timesofisrael.com", "jpost.com",
+    "dailysabah.com", "hurriyet.com.tr", "tehrantimes.com",
+
+    # ── Africa ───────────────────────────────────────────────────────────────
+    "news24.com", "dailymaverick.co.za", "timeslive.co.za",
+    "businessday.ng", "punchng.com", "vanguardngr.com", "theguardian.ng",
+    "standardmedia.co.ke", "nation.africa", "monitor.co.ug",
+    "mg.co.za", "iol.co.za",
+
+    # ── UK ───────────────────────────────────────────────────────────────────
+    "bbc.com", "bbc.co.uk", "theguardian.com", "independent.co.uk",
+    "telegraph.co.uk", "thetimes.co.uk", "ft.com", "economist.com",
+    "dailymail.co.uk", "mirror.co.uk", "thesun.co.uk", "express.co.uk",
+    "metro.co.uk", "eveningstandard.co.uk", "cityam.com",
+    "sky.com", "itv.com", "channel4.com",
+
+    # ── Europe ───────────────────────────────────────────────────────────────
+    "dw.com", "france24.com", "rfi.fr", "euronews.com", "politico.eu",
+    "lemonde.fr", "lefigaro.fr", "liberation.fr",
+    "spiegel.de", "faz.net", "sueddeutsche.de", "zeit.de",
+    "corriere.it", "repubblica.it", "elpais.com", "elmundo.es",
+    "rtve.es", "svt.se", "dn.se", "nrc.nl", "volkskrant.nl",
+    "derstandard.at", "nzz.ch", "rts.ch", "yle.fi",
+    "reuters.com",
+
+    # ── US — General News ────────────────────────────────────────────────────
+    "apnews.com", "nytimes.com", "washingtonpost.com", "wsj.com",
+    "usatoday.com", "latimes.com", "nypost.com", "chicagotribune.com",
+    "bostonglobe.com", "sfchronicle.com", "seattletimes.com",
+    "cnn.com", "foxnews.com", "msnbc.com", "nbcnews.com",
+    "abcnews.go.com", "cbsnews.com", "npr.org", "pbs.org",
+    "theatlantic.com", "newyorker.com", "politico.com", "axios.com",
+    "thehill.com", "salon.com", "slate.com", "vox.com",
+    "huffpost.com", "buzzfeednews.com", "propublica.org",
+    "motherjones.com", "thenation.com", "reason.com",
+    "newsweek.com", "time.com", "rollingstone.com",
+
+    # ── US — Business & Finance ──────────────────────────────────────────────
+    "bloomberg.com", "cnbc.com", "forbes.com", "fortune.com",
+    "businessinsider.com", "marketwatch.com", "barrons.com",
+    "investopedia.com", "seekingalpha.com", "morningstar.com",
+
+    # ── US — Tech ────────────────────────────────────────────────────────────
+    "techcrunch.com", "theverge.com", "wired.com", "arstechnica.com",
+    "engadget.com", "cnet.com", "zdnet.com", "venturebeat.com",
+    "gizmodo.com", "mashable.com", "technologyreview.com",
+    "9to5mac.com", "9to5google.com", "androidpolice.com",
+
+    # ── Science & Health ─────────────────────────────────────────────────────
+    "nature.com", "science.org", "newscientist.com", "scientificamerican.com",
+    "statnews.com", "medscape.com", "webmd.com", "healthline.com",
+    "livescience.com", "space.com", "nationalgeographic.com",
+    "discovermagazine.com", "popularmechanics.com", "popsci.com",
+
+    # ── Sport ────────────────────────────────────────────────────────────────
+    "espn.com", "sportingnews.com", "goal.com", "skysports.com",
+    "bbc.com/sport", "theathletic.com", "bleacherreport.com",
+    "nfl.com", "nba.com", "mlb.com", "nhl.com",
+    "fifa.com", "uefa.com", "olympics.com",
+
+    # ── Canada ───────────────────────────────────────────────────────────────
+    "cbc.ca", "globeandmail.com", "nationalpost.com", "torontostar.com",
+    "vancouversun.com", "montrealgazette.com", "ctvnews.ca", "globalnews.ca",
+
+    # ── Wire / Agencies ──────────────────────────────────────────────────────
+    "reuters.com", "apnews.com", "afp.com", "bloomberg.com",
+    "upi.com", "prnewswire.com", "businesswire.com",
+}
+
 # ─── Domains that are definitely NOT news articles ────────────────────────────
 NON_NEWS_DOMAINS = {
     "youtube.com", "youtu.be", "instagram.com", "facebook.com", "twitter.com",
@@ -66,7 +191,7 @@ BROWSER_HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,<b>/</b>;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "DNT": "1",
@@ -236,7 +361,7 @@ async def resolve_url(url: str) -> tuple[str, str]:
             content_parts = []
 
             # Extract page title
-            title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+            title_match = re.search(r'<title[^>]<b>>(.</b>?)</title>', html, re.IGNORECASE | re.DOTALL)
             if title_match:
                 content_parts.append("TITLE: " + re.sub(r'\s+', ' ', title_match.group(1)).strip())
 
@@ -277,7 +402,7 @@ async def resolve_url(url: str) -> tuple[str, str]:
 
             # Extract article/main body text (strip HTML tags)
             article_match = re.search(
-                r'<(?:article|main)[^>]*>(.*?)</(?:article|main)>',
+                r'<(?:article|main)[^>]<b>>(.</b>?)</(?:article|main)>',
                 html, re.IGNORECASE | re.DOTALL
             )
             if article_match:
@@ -330,6 +455,31 @@ async def is_news_article(url: str) -> tuple[bool, str, str]:
             domain = get_domain(final_url)
             return False, f"Link redirects to {domain}, which is not a news outlet.", ""
 
+        # Quick accept: trusted news domains — no AI needed
+        final_domain = get_domain(final_url)
+        original_domain = get_domain(url)
+        for domain in (final_domain, original_domain):
+            if any(domain == td or domain.endswith("." + td) for td in TRUSTED_NEWS_DOMAINS):
+                # Still generate a summary if we have page content
+                summary = ""
+                if page_content:
+                    try:
+                        summary_prompt = f"""Summarise this news article in 2-3 sentences in plain English.
+Page content:
+{page_content[:3000]}
+Respond with ONLY the summary, nothing else."""
+                        async with httpx.AsyncClient(timeout=15) as client:
+                            resp = await client.post(
+                                GEMINI_URL,
+                                headers={"Content-Type": "application/json"},
+                                json={"contents": [{"parts": [{"text": summary_prompt}]}]},
+                            )
+                            summary = resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    except Exception:
+                        summary = ""
+                logger.info(f"Trusted domain auto-accepted: {domain}")
+                return True, f"Recognised news outlet: {domain}.", summary
+
         # Detect paywall / login wall
         paywall_signals = ["sign in to read", "subscribe to continue", "create an account",
                            "log in to access", "premium content", "subscribers only"]
@@ -347,15 +497,19 @@ Extracted page content:
 
 Your job: determine if this is a REAL news article from a legitimate news outlet.
 
-ACCEPT if:
-- Domain is a known news outlet (local or international): straitstimes.com, channelnewsasia.com, bbc.com, reuters.com, scmp.com, theguardian.com, nytimes.com, mothership.sg, todayonline.com, zaobao.com, etc.
-- Content reports on real events: current affairs, politics, business, sports, science, health, etc.
-- Even paywalled articles from real news sites count — the paywall itself proves it's a serious outlet.
+Be LENIENT. When in doubt, accept it.
 
-REJECT if:
-- It's a blog, opinion newsletter, press release, forum, or social media post
-- It's a product page, ad, or spam
-- The domain is not a recognisable news outlet
+ACCEPT if ANY of these are true:
+- Domain looks like a news outlet (even if you don't recognise it — local/regional news sites count)
+- URL structure contains words like /news/, /article/, /world/, /politics/, /business/, /sport/, /tech/
+- Content reports on real events: current affairs, politics, business, sports, science, health, etc.
+- Paywalled articles from any news-looking site — accept them
+- Article has a headline, date, or byline
+
+REJECT only if clearly NOT news:
+- Obviously a blog, forum post, social media, product page, or spam
+- Domain is entertainment/shopping/social (but these are already filtered before reaching you)
+- Content is completely unrelated to any real-world event or topic
 
 Respond ONLY in this exact format, nothing else:
 VALID: true/false
@@ -407,9 +561,9 @@ SUMMARY: 2-3 sentence plain English summary of the article (write "N/A" if not v
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 *News Accountability Bot*\n\n"
+        "👋 <b>News Accountability Bot</b>\n\n"
         "I track who sends a news article every day.\n"
-        "If you miss a day, *$1 goes into the pot!* 💰\n\n"
+        "If you miss a day, <b>$1 goes into the pot!</b> 💰\n\n"
         "Commands:\n"
         "/register — Join the accountability group\n"
         "/status — See today's submissions\n"
@@ -418,7 +572,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/history — Your personal submission history\n"
         "/adjust — Manually adjust someone's balance\n"
         "/help — Show this message",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -447,19 +601,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     done = [m for m in members if m["user_id"] in submitted_ids]
     pending = [m for m in members if m["user_id"] not in submitted_ids]
 
-    msg = f"📋 *Article Status for {today}*\n\n"
+    msg = f"📋 <b>Article Status for {today}</b>\n\n"
     if done:
-        msg += "✅ *Submitted:*\n"
+        msg += "✅ <b>Submitted:</b>\n"
         for m in done:
             msg += f"  • @{m['username']}\n"
     if pending:
-        msg += "\n⏳ *Still waiting:*\n"
+        msg += "\n⏳ <b>Still waiting:</b>\n"
         for m in pending:
             msg += f"  • @{m['username']}\n"
     if not members:
-        msg += "_No members registered yet. Use /register to join!_"
+        msg += "<i>No members registered yet. Use /register to join!</i>"
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -471,15 +625,15 @@ async def cmd_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No members registered yet!")
         return
 
-    msg = f"💸 *Pot Contributions — {year}*\n\n"
+    msg = f"💸 <b>Pot Contributions — {year}</b>\n\n"
     members_sorted = sorted(members, key=lambda m: m["owed"], reverse=True)
     for i, m in enumerate(members_sorted):
         emoji = "🥇" if i == 0 and m["owed"] > 0 else "👤"
-        msg += f"{emoji} @{m['username']} — *${m['owed']:.2f}*\n"
+        msg += f"{emoji} @{m['username']} — <b>${m['owed']:.2f}</b>\n"
 
     total = sum(m["owed"] for m in members)
-    msg += f"\n🍽 *Total pot: ${total:.2f}*"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    msg += f"\n🍽 <b>Total pot: ${total:.2f}</b>"
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_pot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -487,9 +641,9 @@ async def cmd_pot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     members = db.get_members(chat_id, current_year())
     total = sum(m["owed"] for m in members)
     await update.message.reply_text(
-        f"🍽 Current pot: *${total:.2f}*\n"
+        f"🍽 Current pot: <b>${total:.2f}</b>\n"
         f"Keep sharing those articles to keep your tab clean! 📰",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -503,14 +657,17 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No submission history found for this year.")
         return
 
-    msg = f"📅 *Your submission history ({year}):*\n\n"
+    msg = f"📅 <b>Your submission history ({year}):</b>\n\n"
     for r in records[-20:]:
-        status = "✅" if r["submitted"] else "❌ ($1)"
-        msg += f"{status} {r['date']}\n"
+        if r["submitted"]:
+            url_part = f'\n    <a href="{r["url"]}">{r["url"][:50]}{"..." if len(r["url"]) > 50 else ""}</a>' if r.get("url") else ""
+            msg += f"✅ {r['date']}{url_part}\n\n"
+        else:
+            msg += f"❌ {r['date']} ($1 owed)\n\n"
 
     owed = db.get_member_owed(chat_id, user.id, year)
-    msg += f"\n💸 Total owed: *${owed:.2f}*"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    msg += f"\n💸 Total owed: <b>${owed:.2f}</b>"
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -519,15 +676,15 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
 
     usage = (
-        "⚙️ *Usage:*\n"
-        "`/adjust @username set <amount>` — set balance to exact amount\n"
-        "`/adjust @username add <amount>` — add to balance\n"
-        "`/adjust @username remove <amount>` — subtract from balance\n\n"
-        "_Example: `/adjust @john remove 1`_"
+        "⚙️ <b>Usage:</b>\n"
+        "<code>/adjust @username set <amount></code> — set balance to exact amount\n"
+        "<code>/adjust @username add <amount></code> — add to balance\n"
+        "<code>/adjust @username remove <amount></code> — subtract from balance\n\n"
+        "<i>Example: <code>/adjust @john remove 1</code></i>"
     )
 
     if not args or len(args) < 3:
-        await update.message.reply_text(usage, parse_mode="Markdown")
+        await update.message.reply_text(usage, parse_mode="HTML")
         return
 
     raw_target, action, raw_amount = args[0], args[1].lower(), args[2]
@@ -535,8 +692,8 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action not in ("set", "add", "remove"):
         await update.message.reply_text(
-            f"❌ Unknown action `{action}`. Use `set`, `add`, or `remove`.\n\n{usage}",
-            parse_mode="Markdown",
+            f"❌ Unknown action <code>{action}</code>. Use <code>set</code>, <code>add</code>, or <code>remove</code>.\n\n{usage}",
+            parse_mode="HTML",
         )
         return
 
@@ -546,8 +703,8 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError
     except ValueError:
         await update.message.reply_text(
-            "❌ Amount must be a positive number, e.g. `1`, `2.50`.",
-            parse_mode="Markdown",
+            "❌ Amount must be a positive number, e.g. <code>1</code>, <code>2.50</code>.",
+            parse_mode="HTML",
         )
         return
 
@@ -558,9 +715,9 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not target:
         await update.message.reply_text(
-            f"❌ Couldn't find `@{target_username}` in registered members.\n"
-            f"Make sure they've used `/register` and the username is spelled correctly.",
-            parse_mode="Markdown",
+            f"❌ Couldn't find <code>@{target_username}</code> in registered members.\n"
+            f"Make sure they've used <code>/register</code> and the username is spelled correctly.",
+            parse_mode="HTML",
         )
         return
 
@@ -569,28 +726,28 @@ async def cmd_adjust(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "set":
         db.set_owed(chat_id, target["user_id"], amount, year)
         new_balance = amount
-        verb = f"set to *${new_balance:.2f}*"
+        verb = f"set to <b>${new_balance:.2f}</b>"
     elif action == "add":
         db.add_owed(chat_id, target["user_id"], amount, year)
         new_balance = old_balance + amount
-        verb = f"increased by *${amount:.2f}* → now *${new_balance:.2f}*"
+        verb = f"increased by <b>${amount:.2f}</b> → now <b>${new_balance:.2f}</b>"
     else:
         new_amount = max(0.0, old_balance - amount)
         db.set_owed(chat_id, target["user_id"], new_amount, year)
         new_balance = new_amount
         actually_removed = old_balance - new_amount
-        verb = f"reduced by *${actually_removed:.2f}* → now *${new_balance:.2f}*"
+        verb = f"reduced by <b>${actually_removed:.2f}</b> → now <b>${new_balance:.2f}</b>"
 
     adjuster = update.effective_user.username or update.effective_user.first_name
     total_pot = sum(m["owed"] for m in db.get_members(chat_id, year))
 
     await update.message.reply_text(
-        f"✏️ *Balance adjusted!*\n\n"
+        f"✏️ <b>Balance adjusted!</b>\n\n"
         f"👤 @{target['username']}'s balance {verb}\n"
         f"_(was ${old_balance:.2f})_\n\n"
-        f"🍽 *New pot total: ${total_pot:.2f}*\n\n"
+        f"🍽 <b>New pot total: ${total_pot:.2f}</b>\n\n"
         f"_Adjusted by @{adjuster}_",
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -602,7 +759,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Detect URLs in messages and verify if they are news articles."""
+    logger.info(f"handle_message triggered — update_id={update.update_id}")
+
     if not update.message:
+        logger.info("Ignored: no message object")
         return
 
     user = update.effective_user
@@ -610,14 +770,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = today_str()
     year = current_year()
 
-    if not db.is_member(chat_id, user.id, year):
+    logger.info(f"Message from user_id={user.id} @{user.username} in chat_id={chat_id}")
+    logger.info(f"Message text: {update.message.text!r}")
+    logger.info(f"Message entities: {update.message.entities}")
+
+    is_member = db.is_member(chat_id, user.id, year)
+    logger.info(f"Is registered member: {is_member}")
+
+    if not is_member:
+        logger.info(f"Ignored: user {user.id} not a registered member")
         return
 
-    # Extract all URLs from the message, then pick the best one
     all_urls = extract_urls(update)
+    logger.info(f"Extracted URLs: {all_urls}")
+
     url = pick_best_url(all_urls)
+    logger.info(f"Best URL picked: {url}")
 
     if not url:
+        logger.info("Ignored: no valid URL found in message")
         return
 
     # Already submitted today
@@ -633,22 +804,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_to_message_id=update.message.message_id,
     )
 
-    is_valid, reason, summary = await is_news_article(url)
+    try:
+        is_valid, reason, summary = await asyncio.wait_for(is_news_article(url), timeout=30)
+    except asyncio.TimeoutError:
+        await thinking_msg.edit_text(
+            "⏱ Took too long to check that link — the site may be slow or blocking bots.\n\n"
+            "Try sending the original article URL directly instead of a shortened link!"
+        )
+        return
 
     if is_valid:
         db.record_submission(chat_id, user.id, today, url, year)
         msg = (
-            f"✅ *Article accepted!* @{user.username or user.first_name} has submitted their article for today.\n\n"
-            f"📝 *Summary:* {summary}\n\n"
+            f"✅ <b>Article accepted!</b> @{user.username or user.first_name} has submitted their article for today.\n\n"
+            f"📝 <b>Summary:</b> {summary}\n\n"
             f"_{reason}_"
         )
-        await thinking_msg.edit_text(msg, parse_mode="Markdown")
+        await thinking_msg.edit_text(msg, parse_mode="HTML")
     else:
         await thinking_msg.edit_text(
-            f"❌ *Not accepted.* That doesn't appear to be a legitimate news article.\n\n"
+            f"❌ <b>Not accepted.</b> That doesn't appear to be a legitimate news article.\n\n"
             f"_{reason}_\n\n"
             f"Please send a valid news article link to fulfil today's quota!",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
 
@@ -681,12 +859,12 @@ async def midnight_check(app: Application):
         total_pot = sum(m["owed"] for m in db.get_members(chat_id, year))
         names = ", ".join(f"@{m['username']}" for m in defaulters)
         msg = (
-            f"🌙 *Daily Check — {yesterday}*\n\n"
+            f"🌙 <b>Daily Check — {yesterday}</b>\n\n"
             f"❌ No article submitted: {names}\n"
-            f"Each owes *$1.00* added to the pot.\n\n"
-            f"🍽 *Pot total: ${total_pot:.2f}*"
+            f"Each owes <b>$1.00</b> added to the pot.\n\n"
+            f"🍽 <b>Pot total: ${total_pot:.2f}</b>"
         )
-        await app.bot.send_message(chat_id, msg, parse_mode="Markdown")
+        await app.bot.send_message(chat_id, msg, parse_mode="HTML")
 
 
 # ─── New Year Reset ───────────────────────────────────────────────────────────
@@ -706,14 +884,14 @@ async def new_year_summary(app: Application):
             for m in sorted(members, key=lambda x: x["owed"], reverse=True)
         )
         msg = (
-            f"🎊 *Happy New Year!*\n\n"
-            f"Here's the final pot breakdown for *{last_year}*:\n\n"
+            f"🎊 <b>Happy New Year!</b>\n\n"
+            f"Here's the final pot breakdown for <b>{last_year}</b>:\n\n"
             f"{breakdown}\n\n"
-            f"🍽 *Total pot: ${total:.2f}*\n\n"
+            f"🍽 <b>Total pot: ${total:.2f}</b>\n\n"
             f"Time to plan that meal! 🥂 New year, new articles. Good luck everyone!\n\n"
             f"_All balances have been reset for {last_year + 1}._"
         )
-        await app.bot.send_message(chat_id, msg, parse_mode="Markdown")
+        await app.bot.send_message(chat_id, msg, parse_mode="HTML")
 
         for m in members:
             db.register_member(chat_id, m["user_id"], m["username"], last_year + 1)
@@ -723,6 +901,13 @@ async def new_year_summary(app: Application):
 
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # DEBUG: catch every single update and log it
+    async def debug_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        logger.info(f"DEBUG RAW UPDATE: {update}")
+
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(Update, debug_all), group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))

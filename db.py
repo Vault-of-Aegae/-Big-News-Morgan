@@ -152,7 +152,7 @@ class Database:
     def get_user_history(self, chat_id: int, user_id: int, year: int) -> list[dict]:
         """Return a day-by-day log for a user: submitted or defaulted."""
         submitted_rows = self._conn().execute(
-            "SELECT date, 1 as submitted FROM submissions WHERE chat_id = ? AND user_id = ? AND year = ?",
+            "SELECT date, url, 1 as submitted FROM submissions WHERE chat_id = ? AND user_id = ? AND year = ?",
             (chat_id, user_id, year),
         ).fetchall()
         default_rows = self._conn().execute(
@@ -160,10 +160,10 @@ class Database:
             (chat_id, user_id, year),
         ).fetchall()
 
-        combined = {r["date"]: {"date": r["date"], "submitted": True} for r in submitted_rows}
+        combined = {r["date"]: {"date": r["date"], "submitted": True, "url": r["url"]} for r in submitted_rows}
         for r in default_rows:
             if r["date"] not in combined:
-                combined[r["date"]] = {"date": r["date"], "submitted": False}
+                combined[r["date"]] = {"date": r["date"], "submitted": False, "url": None}
 
         return sorted(combined.values(), key=lambda x: x["date"])
 
