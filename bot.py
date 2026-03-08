@@ -535,17 +535,27 @@ SUMMARY: 2-3 sentence plain English summary of the article (write "N/A" if not v
         is_valid = False
         reason = "Could not determine."
         summary = ""
+        summary_lines = []
+        in_summary = False
 
         for line in response_text.splitlines():
-            line = line.strip()
-            if line.upper().startswith("VALID:"):
-                is_valid = "true" in line.lower()
-            elif line.upper().startswith("REASON:"):
-                reason = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("SUMMARY:"):
-                raw_summary = line.split(":", 1)[1].strip()
-                # Escape Telegram Markdown special characters to prevent formatting crashes
-                summary = raw_summary if raw_summary.upper() != "N/A" else ""
+            line_stripped = line.strip()
+            if line_stripped.upper().startswith("VALID:"):
+                in_summary = False
+                is_valid = "true" in line_stripped.lower()
+            elif line_stripped.upper().startswith("REASON:"):
+                in_summary = False
+                reason = line_stripped.split(":", 1)[1].strip()
+            elif line_stripped.upper().startswith("SUMMARY:"):
+                in_summary = True
+                first_line = line_stripped.split(":", 1)[1].strip()
+                if first_line:
+                    summary_lines.append(first_line)
+            elif in_summary and line_stripped:
+                summary_lines.append(line_stripped)
+
+        raw_summary = " ".join(summary_lines).strip()
+        summary = raw_summary if raw_summary.upper() != "N/A" else ""
 
         return is_valid, reason, summary
 
@@ -817,8 +827,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db.record_submission(chat_id, user.id, today, url, year)
         msg = (
             f"✅ <b>Article accepted!</b> @{user.username or user.first_name} has submitted their article for today.\n\n"
-            f"📝 <b>Summary:</b> {summary}\n\n"
-            f"_{reason}_"
+            + (f"📝 <b>Summary:</b> {summary}\n\n" if summary else "")
+            + f"<i>{reason}</i>"
         )
         await thinking_msg.edit_text(msg, parse_mode="HTML")
     else:
